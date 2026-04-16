@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Posture & Laziness Monitor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- TensorFlow.js & Pose Detection Models -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+    
+    <style>
+        /* Mirror the video and canvas so it acts like a natural mirror */
+        .mirrored {
+            transform: scaleX(-1);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center p-6 font-sans">
+
+    <div class="max-w-3xl w-full">
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold mb-2 text-indigo-400">Posture & Focus Monitor</h1>
+            <p class="text-gray-400">Uses on-device AI to detect slouching or leaning back. Beeps loudly if you get lazy.</p>
+        </div>
+
+        <!-- Main Video Container -->
+        <div class="relative bg-gray-800 rounded-xl overflow-hidden shadow-2xl border-4 border-gray-700 mx-auto w-full aspect-video flex justify-center items-center" id="videoContainer">
+            <div id="loading" class="absolute z-20 flex flex-col items-center">
+                <svg class="animate-spin h-10 w-10 text-indigo-500 mb-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p class="text-gray-300 font-medium" id="loadingText">Waiting for camera start...</p>
+            </div>
+            
+            <video id="video" class="absolute top-0 left-0 w-full h-full object-cover mirrored opacity-0 transition-opacity duration-500" autoplay playsinline muted></video>
+            <canvas id="canvas" class="absolute top-0 left-0 w-full h-full object-cover mirrored z-10"></canvas>
+            
+            <!-- Alert Overlay -->
+            <div id="alertOverlay" class="absolute inset-0 bg-red-600 bg-opacity-40 z-30 hidden flex items-center justify-center">
+                <h2 class="text-6xl font-black text-white drop-shadow-lg animate-pulse">SIT UP!</h2>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <button id="startBtn" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg transition shadow-lg">
+                1. Start Camera
+            </button>
+            <button id="calibrateBtn" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-6 rounded-lg transition shadow-lg opacity-50 cursor-not-allowed" disabled>
+                2. Calibrate Posture
+            </button>
+            <button id="testAlarmBtn" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition shadow-lg">
+                Test Alarm Volume
+            </button>
+        </div>
+
+        <!-- Status Dashboard -->
+        <div class="mt-8 bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 grid grid-cols-2 gap-4 text-center">
+            <div>
+                <p class="text-sm text-gray-400 uppercase tracking-wide">Current Status</p>
+                <p id="statusText" class="text-2xl font-bold text-gray-500">Not Running</p>
+            </div>
+            <div>
+                <p class="text-sm text-gray-400 uppercase tracking-wide">Laziness Timer</p>
+                <p id="timerText" class="text-2xl font-bold text-gray-300">0.0s</p>
+            </div>
+        </div>
+        
+        <div class="mt-6 text-sm text-gray-400 bg-gray-800 p-4 rounded-lg">
+            <strong>Instructions:</strong> Start the camera and allow permissions. Sit with your perfect, focused posture, and look at the screen. Click <strong>Calibrate Posture</strong>. The AI will learn your facial-to-shoulder ratio. If you slouch or lean heavily back for more than 2 seconds, the alarm will sound until you fix it.
+        </div>
+    </div>
+
+    <script>
+        // DOM Elements
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const calibrateBtn = document.getElementById('calibrateBtn');
+        const testAlarmBtn = document.getElementById('testAlarmBtn');
+        const loading = document.getElementById('loading');
+        const loadingText = document.getElementById('loadingText');
+        const statusText = document.getElementById('statusText');
+        const timerText = document.getElementById('timerText');
+        const alertOverlay = document.getElementById('alertOverlay');
+
+        // Application State
+        let detector = null;
+        let isRunning = false;
+        let animationId = null;
+        
+        // Posture Metrics
+        let baselineDistance = 0; // Ideal distance between eyes and shoulders
+        let baselineEyeY = 0; // Ideal absolute Y position of the head
+        let baselineShoulderWidth = 0; // Ideal width to detect leaning backwards
+        let isCalibrated = false;
+        let badPostureFrames = 0;
+        let alarmTriggered = false;
+        const FPS = 30; // Approx frames per second
+        const SECONDS_TO_ALARM = 2; // How long you can be lazy before it screams
+        const FRAMES_TO_ALARM = FPS * SECONDS_TO_ALARM;
+
+        // Audio API
+        let audioCtx = null;
+        let activeOscillator = null;
+
+        // Initialize Web Audio Context (Requires user interaction to play)
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        // Extremely loud and annoying alarm
+        function playAlarm() {
+            if (alarmTriggered) return; // Don't trigger multiple times
+            alarmTriggered = true;
+            alertOverlay.classList.remove('hidden');
+            
+            initAudio();
+            
+            // Create oscillator and gain node
+            activeOscillator = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            
+            // Annoying harsh square wave
+            activeOscillator.type = 'square';
+            
+            // Siren effect: alternate between two high pitches
+            activeOscillator.frequency.setValueAtTime(880, audioCtx.currentTime); // A5
+            activeOscillator.frequency.setValueAtTime(1046.50, audioCtx.currentTime + 0.2); // C6
+            activeOscillator.frequency.setValueAtTime(880, audioCtx.currentTime + 0.4);
+            activeOscillator.frequency.setValueAtTime(1046.50, audioCtx.currentTime + 0.6);
+            
+            // FULL VOLUME (Gain 1.0 is max unclipped volume)
+            gainNode.gain.setValueAtTime(1.0, audioCtx.currentTime); 
+            
+            activeOscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            
+            activeOscillator.start();
+            
+            // Auto stop after a short burst to allow re-triggering if still lazy
+            setTimeout(() => {
+                stopAlarm();
+            }, 800);
+        }
+
+        function stopAlarm() {
+            if (activeOscillator) {
+                try {
+                    activeOscillator.stop();
+                    activeOscillator.disconnect();
+                } catch (e) {}
+                activeOscillator = null;
+            }
+            alarmTriggered = false;
+            alertOverlay.classList.add('hidden');
+        }
+
+        // Test alarm button
+        testAlarmBtn.addEventListener('click', () => {
+            initAudio();
+            playAlarm();
+        });
+
+        // Start Camera and Load AI
+        startBtn.addEventListener('click', async () => {
+            if (isRunning) return;
+            initAudio(); // Unlock audio context on first click
+            
+            startBtn.disabled = true;
+            loadingText.innerText = "Loading AI Model...";
+            
+            try {
+                // Initialize TFJS Backend
+                await tf.ready();
+                
+                // Load MoveNet model
+                const model = poseDetection.SupportedModels.MoveNet;
+                detector = await poseDetection.createDetector(model, {
+                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING
+                });
+
+                loadingText.innerText = "Starting Camera...";
+                
+                // Get Camera Stream
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480, facingMode: 'user' }, 
+                    audio: false 
+                });
+                
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    video.play();
+                    // Match canvas size to video resolution
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    
+                    video.classList.remove('opacity-0');
+                    loading.classList.add('hidden');
+                    
+                    isRunning = true;
+                    calibrateBtn.disabled = false;
+                    calibrateBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    startBtn.innerText = "Camera Active";
+                    
+                    statusText.innerText = "Needs Calibration";
+                    statusText.className = "text-2xl font-bold text-yellow-500";
+                    
+                    // Start detection loop
+                    detectPose();
+                };
+            } catch (error) {
+                console.error(error);
+                loadingText.innerText = "Error accessing camera or loading AI.";
+                startBtn.disabled = false;
+            }
+        });
+
+        // Calibration
+        calibrateBtn.addEventListener('click', () => {
+            if (!isRunning) return;
+            // The actual calibration logic happens in the next frame of detectPose()
+            isCalibrated = false; 
+            statusText.innerText = "Calibrating...";
+            setTimeout(() => {
+                // Setting this flag triggers the calibration save in the loop
+                window.shouldCalibrateNextFrame = true;
+            }, 500); // Give user half a second to sit still after clicking
+        });
+
+        // Main Detection Loop
+        async function detectPose() {
+            if (!isRunning) return;
+
+            // Estimate poses
+            const poses = await detector.estimatePoses(video);
+            
+            // Clear previous drawings
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (poses.length > 0) {
+                const keypoints = poses[0].keypoints;
+                drawKeypoints(keypoints);
+                drawSkeleton(keypoints);
+                
+                analyzePosture(keypoints);
+            }
+
+            // Loop
+            animationId = requestAnimationFrame(detectPose);
+        }
+
+        // Analyze skeletal points to detect laziness
+        function analyzePosture(keypoints) {
+            // Find necessary keypoints
+            const leftEye = keypoints.find(k => k.name === 'left_eye');
+            const rightEye = keypoints.find(k => k.name === 'right_eye');
+            const leftShoulder = keypoints.find(k => k.name === 'left_shoulder');
+            const rightShoulder = keypoints.find(k => k.name === 'right_shoulder');
+
+            // Ensure we can see the upper body confidently
+            const minConfidence = 0.4;
+            if (leftEye.score > minConfidence && rightEye.score > minConfidence && 
+                leftShoulder.score > minConfidence && rightShoulder.score > minConfidence) {
+                
+                // Calculate midpoints and widths
+                const eyeY = (leftEye.y + rightEye.y) / 2;
+                const shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+                const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x) || 1;
+                
+                // Current vertical distance between face and shoulders
+                const currentDistance = shoulderY - eyeY;
+
+                // Handle Calibration
+                if (window.shouldCalibrateNextFrame) {
+                    baselineDistance = currentDistance;
+                    baselineEyeY = eyeY;
+                    baselineShoulderWidth = shoulderWidth;
+                    window.shouldCalibrateNextFrame = false;
+                    isCalibrated = true;
+                    statusText.innerText = "Good Posture";
+                    statusText.className = "text-2xl font-bold text-emerald-500";
+                    badPostureFrames = 0;
+                }
+
+                // Handle Monitoring
+                if (isCalibrated) {
+                    // Calculate ratios to detect different types of bad posture
+                    const distanceRatio = currentDistance / baselineDistance;
+                    const shoulderWidthRatio = shoulderWidth / baselineShoulderWidth;
+                    const eyeYDrop = (eyeY - baselineEyeY) / canvas.height;
+                    
+                    // Heuristics:
+                    // 1. Hunched: Head dropped close to shoulders
+                    const isHunched = distanceRatio < 0.75;
+                    // 2. Leaning Back: Shoulders got >20% smaller (moved further from camera)
+                    const isLeaningBack = shoulderWidthRatio < 0.80;
+                    // 3. Slumping: Head dropped significantly down the screen (>12% of height)
+                    const isSlumping = eyeYDrop > 0.12;
+
+                    const isLazy = isHunched || isLeaningBack || isSlumping;
+
+                    if (isLazy) {
+                        badPostureFrames++;
+                        if (isHunched) statusText.innerText = "HUNCHING FORWARD!";
+                        else if (isLeaningBack) statusText.innerText = "LEANING BACK!";
+                        else if (isSlumping) statusText.innerText = "SLUMPING IN CHAIR!";
+                        
+                        statusText.className = "text-2xl font-bold text-red-500";
+                    } else {
+                        // Recovering posture reduces the bad frame count quickly
+                        badPostureFrames = Math.max(0, badPostureFrames - 2); 
+                        if (badPostureFrames === 0) {
+                            statusText.innerText = "Good Posture";
+                            statusText.className = "text-2xl font-bold text-emerald-500";
+                        }
+                    }
+                }
+            } else {
+                if (isCalibrated) {
+                     // If calibrated but we can't see you, you're out of frame or head down!
+                     badPostureFrames++; 
+                     statusText.innerText = "OUT OF FRAME / HEAD DOWN!";
+                     statusText.className = "text-2xl font-bold text-orange-500";
+                }
+            }
+            
+            // Universal Timer and Alarm Check (Happens whether we see you or not)
+            if (isCalibrated) {
+                // Update UI Timer
+                const lazySeconds = (badPostureFrames / FPS).toFixed(1);
+                timerText.innerText = `${lazySeconds}s`;
+                
+                if (badPostureFrames > 0) {
+                    timerText.classList.add('text-red-500');
+                    timerText.classList.remove('text-gray-300');
+                } else {
+                    timerText.classList.remove('text-red-500');
+                    timerText.classList.add('text-gray-300');
+                }
+
+                // Trigger Alarm
+                if (badPostureFrames >= FRAMES_TO_ALARM) {
+                    playAlarm();
+                    // We don't reset badPostureFrames here, so if they stay lazy, 
+                    // the alarm keeps re-triggering via the timeout loop
+                }
+            }
+        }
+
+        // Visualization Helpers
+        function drawKeypoints(keypoints) {
+            keypoints.forEach(keypoint => {
+                if (keypoint.score > 0.4) {
+                    ctx.beginPath();
+                    ctx.arc(keypoint.x, keypoint.y, 5, 0, 2 * Math.PI);
+                    ctx.fillStyle = '#10b981'; // Emerald 500
+                    ctx.fill();
+                }
+            });
+        }
+
+        function drawSkeleton(keypoints) {
+            const adjacentKeyPoints = poseDetection.util.getAdjacentPairs(poseDetection.SupportedModels.MoveNet);
+            adjacentKeyPoints.forEach(([i, j]) => {
+                const kp1 = keypoints[i];
+                const kp2 = keypoints[j];
+
+                if (kp1.score > 0.4 && kp2.score > 0.4) {
+                    ctx.beginPath();
+                    ctx.moveTo(kp1.x, kp1.y);
+                    ctx.lineTo(kp2.x, kp2.y);
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = '#6366f1'; // Indigo 500
+                    ctx.stroke();
+                }
+            });
+        }
+    </script>
+</body>
+</html>
