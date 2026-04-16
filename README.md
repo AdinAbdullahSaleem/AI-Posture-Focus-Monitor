@@ -34,7 +34,7 @@ Uses your webcam and **TensorFlow.js MoveNet** pose estimation to track your upp
 
 ## Quick Start
 
-1. **Open `main.html`** in any modern browser (Chrome, Edge, Firefox, Safari).
+1. **Open `index.html`** in any modern browser (Chrome, Edge, Firefox, Safari).
 2. Click **Start Camera** and grant camera permission.
 3. Sit in your ideal posture, looking at the screen.
 4. Click **Calibrate Posture**.
@@ -66,7 +66,7 @@ Webcam → TensorFlow.js MoveNet (pose estimation) → Keypoint Analysis → Pos
 
 ```
 AI-Posture-Focus-Monitor/
-├── main.html      # Complete application (HTML + CSS + JS in one file)
+├── index.html     # Complete application (HTML + CSS + JS in one file)
 ├── README.md      # This file
 └── LICENSE         # MIT License
 ```
