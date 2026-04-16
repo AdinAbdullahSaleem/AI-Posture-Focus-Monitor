@@ -207,17 +207,22 @@
         let baselineEyeY = 0;
         let baselineShoulderWidth = 0;
         let isCalibrated = false;
-        let badPostureFrames = 0;
         let alarmTriggered = false;
+
+        // Wall-clock posture tracking (replaces frame counting)
+        let badPostureStartTime = null;  // timestamp when bad posture began (null = good)
+        let accumulatedBadSec = 0;       // seconds of bad posture built up
+        let lastGoodTime = null;         // timestamp when good posture resumed (for countdown)
+        let countdownDrainRate = 1;      // computed when transitioning to good posture
 
         // Session statistics
         let sessionStartTime = null;
         let totalFrames = 0;
         let goodFrames = 0;
         let sessionTimerInterval = null;
+        let postureTickInterval = null;  // 200ms tick for timer UI + background alarm
 
         // ─── Configurable Thresholds ────────────────────────────────
-        const ESTIMATED_FPS = 30;
         let alarmDelaySec = 2;
         let alarmVolume = 0.8;
 
@@ -301,11 +306,17 @@
         }
 
         // ─── Page Visibility ────────────────────────────────────────
+        // When tab is hidden, rAF stops. We switch to a setInterval fallback
+        // so posture detection + alarms keep working in the background.
+        let bgInterval = null;
         document.addEventListener('visibilitychange', () => {
             if (document.hidden && isRunning) {
                 cancelAnimationFrame(animationId);
+                // Run detection at ~4 FPS in background (enough for posture checks)
+                bgInterval = setInterval(() => { detectPose(true); }, 250);
             } else if (!document.hidden && isRunning) {
-                detectPose();
+                if (bgInterval) { clearInterval(bgInterval); bgInterval = null; }
+                detectPose(false);
             }
         });
 
@@ -388,6 +399,32 @@
             totalFrames = 0;
             goodFrames = 0;
             sessionTimerInterval = setInterval(updateSessionDisplay, 1000);
+            // 200ms tick keeps timer UI smooth and triggers alarms even in background
+            postureTickInterval = setInterval(updatePostureTick, 200);
+        }
+
+        function updatePostureTick() {
+            if (!isCalibrated) return;
+            const now = Date.now();
+
+            if (badPostureStartTime !== null) {
+                // Currently in bad posture — accumulate real elapsed time
+                accumulatedBadSec = (now - badPostureStartTime) / 1000;
+            } else if (accumulatedBadSec > 0 && lastGoodTime !== null) {
+                // Good posture — countdown the accumulated time
+                const goodElapsed = (now - lastGoodTime) / 1000;
+                accumulatedBadSec = Math.max(0, accumulatedBadSec - goodElapsed * countdownDrainRate);
+                lastGoodTime = now; // reset so next tick measures from here
+            }
+
+            // Update timer display
+            timerText.textContent = `${accumulatedBadSec.toFixed(1)}s`;
+            timerText.className = `text-lg sm:text-2xl font-bold mt-1 tabular-nums ${accumulatedBadSec > 0 ? 'text-red-500' : 'text-gray-300'}`;
+
+            // Trigger alarm
+            if (accumulatedBadSec >= alarmDelaySec) {
+                playAlarm();
+            }
         }
 
         function updateSessionDisplay() {
@@ -405,25 +442,32 @@
         }
 
         // ─── Main Detection Loop ────────────────────────────────────
-        async function detectPose() {
-            if (!isRunning || document.hidden) return;
+        async function detectPose(isBackground = false) {
+            if (!isRunning) return;
 
             try {
                 const poses = await detector.estimatePoses(video);
 
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                // Only draw when visible (canvas not rendered in background anyway)
+                if (!isBackground) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    if (poses.length > 0) {
+                        drawKeypoints(poses[0].keypoints);
+                        drawSkeleton(poses[0].keypoints);
+                    }
+                }
 
                 if (poses.length > 0) {
-                    const keypoints = poses[0].keypoints;
-                    drawKeypoints(keypoints);
-                    drawSkeleton(keypoints);
-                    analyzePosture(keypoints);
+                    analyzePosture(poses[0].keypoints);
                 }
             } catch (err) {
                 console.warn('Detection frame error:', err);
             }
 
-            animationId = requestAnimationFrame(detectPose);
+            // Only schedule next rAF if in foreground (background uses setInterval)
+            if (!isBackground) {
+                animationId = requestAnimationFrame(() => detectPose(false));
+            }
         }
 
         // ─── Posture Analysis ───────────────────────────────────────
@@ -438,6 +482,8 @@
                 leftEye.score > MIN_CONFIDENCE && rightEye.score > MIN_CONFIDENCE &&
                 leftShoulder.score > MIN_CONFIDENCE && rightShoulder.score > MIN_CONFIDENCE;
 
+            const now = Date.now();
+
             if (hasUpperBody) {
                 const eyeY = (leftEye.y + rightEye.y) / 2;
                 const shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
@@ -451,7 +497,9 @@
                     baselineShoulderWidth = shoulderWidth;
                     shouldCalibrateNextFrame = false;
                     isCalibrated = true;
-                    badPostureFrames = 0;
+                    accumulatedBadSec = 0;
+                    badPostureStartTime = null;
+                    lastGoodTime = null;
                     statusText.textContent = 'Good Posture ✓';
                     statusText.className = 'text-lg sm:text-2xl font-bold text-emerald-500 mt-1';
                     startSessionTimer();
@@ -470,7 +518,12 @@
                     const isLazy = isHunched || isLeaningBack || isSlumping;
 
                     if (isLazy) {
-                        badPostureFrames++;
+                        // Transition to bad posture
+                        if (badPostureStartTime === null) {
+                            // Carry over any remaining accumulated time
+                            badPostureStartTime = now - (accumulatedBadSec * 1000);
+                            lastGoodTime = null;
+                        }
                         const reason = isHunched ? 'HUNCHING FORWARD!'
                             : isLeaningBack ? 'LEANING BACK!'
                             : 'SLUMPING IN CHAIR!';
@@ -478,8 +531,20 @@
                         statusText.className = 'text-lg sm:text-2xl font-bold text-red-500 mt-1';
                     } else {
                         goodFrames++;
-                        badPostureFrames = Math.max(0, badPostureFrames - 2);
-                        if (badPostureFrames === 0) {
+                        // Transition to good posture
+                        if (badPostureStartTime !== null) {
+                            // Freeze accumulated time and start countdown
+                            accumulatedBadSec = (now - badPostureStartTime) / 1000;
+                            badPostureStartTime = null;
+                            lastGoodTime = now;
+                            // Drain in half of alarm delay when over threshold,
+                            // or half of accumulated time when under
+                            const drainTime = accumulatedBadSec > alarmDelaySec
+                                ? alarmDelaySec / 2
+                                : accumulatedBadSec / 2;
+                            countdownDrainRate = accumulatedBadSec / Math.max(drainTime, 0.1);
+                        }
+                        if (accumulatedBadSec === 0) {
                             statusText.textContent = 'Good Posture ✓';
                             statusText.className = 'text-lg sm:text-2xl font-bold text-emerald-500 mt-1';
                         }
@@ -487,21 +552,13 @@
                 }
             } else if (isCalibrated) {
                 totalFrames++;
-                badPostureFrames++;
+                // Can't see you — treat as bad posture
+                if (badPostureStartTime === null) {
+                    badPostureStartTime = now - (accumulatedBadSec * 1000);
+                    lastGoodTime = null;
+                }
                 statusText.textContent = 'OUT OF FRAME / HEAD DOWN!';
                 statusText.className = 'text-lg sm:text-2xl font-bold text-orange-500 mt-1';
-            }
-
-            // Timer & alarm
-            if (isCalibrated) {
-                const lazySeconds = (badPostureFrames / ESTIMATED_FPS).toFixed(1);
-                timerText.textContent = `${lazySeconds}s`;
-                timerText.className = `text-lg sm:text-2xl font-bold mt-1 tabular-nums ${badPostureFrames > 0 ? 'text-red-500' : 'text-gray-300'}`;
-
-                const framesThreshold = ESTIMATED_FPS * alarmDelaySec;
-                if (badPostureFrames >= framesThreshold) {
-                    playAlarm();
-                }
             }
         }
 

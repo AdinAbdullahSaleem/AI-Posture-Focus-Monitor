@@ -2,6 +2,8 @@
 
 Real-time posture detection that runs entirely in your browser using on-device AI. No servers, no data leaves your machine.
 
+**[Live Demo](https://adinabdullahsaleem.github.io/AI-Posture-Focus-Monitor/)**
+
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![TensorFlow.js](https://img.shields.io/badge/TensorFlow.js-4.22-orange.svg)
 ![MoveNet](https://img.shields.io/badge/model-MoveNet_Lightning-green.svg)
